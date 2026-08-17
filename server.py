@@ -57,8 +57,22 @@ for model_name, config in AVAILABLE_MODELS.items():
 MIN_BATCH_SIZE = 1
 DEFAULT_MAX_BATCH = 1024  # Increased for stress testing
 DEFAULT_MAX_LENGTH = 8192
+# Ceiling on MLX's size-keyed buffer cache, applied at import (see mx.clear_cache() in
+# _embed_texts for the measurements and the mechanism). The per-request clear is the primary
+# control; this is the backstop that bounds growth WITHIN a single large batch, where there is
+# no request boundary to clear at. 2 GB sits well above the ~2.5 GB steady-state working set's
+# churn and far below the point where the box starts swapping.
+# 0 disables MLX's cache entirely (correct but slower — every allocation goes to the OS).
+MLX_CACHE_LIMIT_BYTES = int(os.getenv("MLX_CACHE_LIMIT_BYTES", str(2 * 1024**3)))
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "0.0.0.0"
+
+# Apply the cache ceiling once, at import, before any model work allocates.
+try:
+    mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
+except Exception:
+    pass   # older mlx without the API: the per-request clear_cache() still applies
+
 
 # Configure logging
 def setup_logging(level: str = "INFO") -> logging.Logger:
@@ -331,7 +345,32 @@ class ModelManager:
                 self._embedding_cache[cache_key] = embedding
             
             embeddings.append(embedding)
-        
+
+        # --- BOUND THE MLX BUFFER CACHE (added 2026-08-17) --------------------------------
+        # MLX's allocator caches freed GPU buffers KEYED BY SIZE and does not return them to
+        # the OS. Every distinct token count here produces a distinct array shape, because
+        # `mx.array([tokens])` is built from the raw token list with NO padding — so a corpus
+        # with many text lengths mints a new set of buffer sizes for each one, and they all
+        # accumulate for the lifetime of the process.
+        #
+        # MEASURED on this server, 60 requests per arm:
+        #   identical token length (60 texts, one shape) .... 2474 -> 2695 MB, settled to 2514
+        #   60 DISTINCT token lengths ...................... 2514 MB -> 10 GB
+        # ~125 MB per novel sequence length. That is the whole story of the 22 GB-in-49-minutes
+        # growth during RAG ingestion: ingest chunks have many distinct lengths. It scales with
+        # SHAPE DIVERSITY, not with request volume.
+        #
+        # This is reclaimable cache, not a true leak, so clearing it is sufficient and — unlike
+        # padding to fixed-size buckets — it changes NO numerics. Bucketing would pad the
+        # sequence, and `mx.mean(hidden_states, axis=1)` pools over EVERY position, so padded
+        # positions would pollute the embedding and make new vectors incomparable with the
+        # 2560-dim vectors already in Qdrant. That fix needs masked pooling + a re-index, and
+        # is deliberately NOT bundled in here.
+        try:
+            mx.clear_cache()
+        except Exception:   # never fail a served request over a memory-hygiene call
+            pass
+
         return np.array(embeddings, dtype=np.float32), model_name, embedding_dim
     
     def get_status(self, model_name: Optional[str] = None) -> Dict[str, Any]:
@@ -448,6 +487,42 @@ class HealthResponse(BaseModel):
     embedding_dim: int = Field(..., description="Embedding dimension")
     memory_usage_mb: Optional[float] = Field(None, description="Memory usage in MB")
     uptime_seconds: float = Field(..., description="Service uptime in seconds")
+
+# --- OpenAI-compatible models ---
+
+# Map external model names (e.g. from Ollama) to local aliases
+OPENAI_MODEL_MAP = {
+    "qwen3-embedding:4b": "medium",
+    "qwen3-embedding:0.6b": "small",
+    "qwen3-embedding:8b": "large",
+    "text-embedding-ada-002": "medium",  # fallback for default OpenAI model names
+}
+
+class OpenAIEmbeddingRequest(BaseModel):
+    """OpenAI-compatible embeddings request."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    input: str | List[str] = Field(..., description="Text or list of texts to embed")
+    model: str = Field(default="medium", description="Model name")
+    encoding_format: Optional[str] = Field(default="float", description="Ignored — always returns float")
+
+class OpenAIEmbeddingData(BaseModel):
+    """Single embedding in OpenAI response format."""
+    object: str = "embedding"
+    embedding: List[float]
+    index: int
+
+class OpenAIEmbeddingUsage(BaseModel):
+    """Token usage stub (approximate)."""
+    prompt_tokens: int
+    total_tokens: int
+
+class OpenAIEmbeddingResponse(BaseModel):
+    """OpenAI-compatible embeddings response."""
+    object: str = "list"
+    data: List[OpenAIEmbeddingData]
+    model: str
+    usage: OpenAIEmbeddingUsage
 
 # Application lifespan management
 @asynccontextmanager
@@ -694,11 +769,76 @@ async def get_metrics():
 async def list_models():
     """
     List available models and their status.
-    
+
     Returns information about all available models,
     their aliases, and current loading status.
     """
     return model_manager.get_status()
+
+# --- OpenAI-compatible endpoint ---
+
+@app.post(
+    "/v1/embeddings",
+    response_model=OpenAIEmbeddingResponse,
+    tags=["OpenAI Compatible"],
+    status_code=status.HTTP_200_OK,
+)
+async def openai_embeddings(request: OpenAIEmbeddingRequest):
+    """
+    OpenAI-compatible embeddings endpoint.
+
+    Accepts the same request format as OpenAI's /v1/embeddings API,
+    enabling drop-in replacement for tools that use OpenAIEmbedder
+    (e.g. graphiti-core, LangChain, LlamaIndex).
+    """
+    try:
+        start_time = time.time()
+
+        # Normalize input to list
+        texts = [request.input] if isinstance(request.input, str) else request.input
+        if not texts:
+            raise HTTPException(status_code=400, detail="Input cannot be empty")
+
+        # Resolve model name through the external map, then fall through to aliases
+        resolved_model = OPENAI_MODEL_MAP.get(request.model, request.model)
+
+        embeddings, model_used, embedding_dim = await model_manager.generate_embeddings(
+            texts,
+            model_name=resolved_model,
+            normalize=True,
+        )
+
+        # Approximate token count (chars / 4 is a rough heuristic)
+        approx_tokens = sum(len(t) for t in texts) // 4
+
+        data = [
+            OpenAIEmbeddingData(
+                embedding=emb.tolist(),
+                index=i,
+            )
+            for i, emb in enumerate(embeddings)
+        ]
+
+        processing_time = (time.time() - start_time) * 1000
+        logger.info(f"OpenAI-compat: {len(texts)} texts, model={model_used}, {processing_time:.1f}ms")
+
+        return OpenAIEmbeddingResponse(
+            data=data,
+            model=model_used,
+            usage=OpenAIEmbeddingUsage(
+                prompt_tokens=approx_tokens,
+                total_tokens=approx_tokens,
+            ),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OpenAI embeddings endpoint failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Embedding generation failed: {str(e)}",
+        )
 
 # Error handlers
 @app.exception_handler(ValueError)
